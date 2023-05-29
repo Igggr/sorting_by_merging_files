@@ -21,7 +21,7 @@ export async function mergeSort(
     chunkSize = 2000,
 ): Promise<void> {
     const files = await writeChunks(inputFilePath, chunkSize);
-    merge(files, outputFilePath);
+    await merge(files, outputFilePath);
     await clear(files);
 }
 
@@ -39,56 +39,62 @@ async function writeChunks(
         crlfDelay: Infinity
     });
 
-    let chunk = [];
+    let chunk: string[] = [];
     let counter = 1; // на каком chunk-е остановились
-    let i = 1;
+    // let i = 1;
 
     if (!fs.existsSync('tmp')) {
         fs.mkdirSync('tmp', { recursive: true });
     }
 
+    let writer: fs.WriteStream;
     for await (const line of rl) {
         if (!line) {
             continue;
         }
-        console.log(`${i++}:`, `'${line}'`);
-        
+        // console.log(`${i++}:`, `'${line}'`);
+
         if (chunk.length < chunkSize) {
             chunk.push(line);
         } else {
             // если продолжать добавлять оперативка рискует переполниться
             // отсоритровать и записать во временный файл
 
-            chunk.sort();
             const tmpFilePath = getTmpFile(counter);
             fileSet.add(tmpFilePath);
-            const writer = getWriteStream(tmpFilePath);
-
-            try {
-                console.log('formed chunk:', chunk)
-                for (const line of chunk) {
-                    await writer.write(line);
-                    await writer.write('\n');
-                }
-                counter++;
-                chunk = [];
-                await finish(writer);
-                console.log('closed: ', tmpFilePath)
-            } catch (e) { 
-                console.log(e);
-            } 
+            await writeChunk(chunk, tmpFilePath);
+  
+            counter++;
+            chunk = [line];
         }
     }
-    rl.close();
+    
+    // @ts-ignore
+    if (chunk.length > 0) {
+        const tmpFilePath = getTmpFile(counter);
+        fileSet.add(tmpFilePath);
+        writeChunk(chunk, tmpFilePath);
+    }
 
     return fileSet;
+}
+
+async function writeChunk(chunk: string[], filePath: string) {
+    // кажется зависит от локали. сейчас только для английского
+    chunk.sort();
+    const writer = getWriteStream(filePath);
+    for (const line of chunk) {
+        await writer.write(line);
+        await writer.write('\n');
+    }
+    await finish(writer);
 }
 
 function getTmpFile(counter: number) {
     return path.resolve('tmp', `${counter}.txt`);
 }
 
-function getWriteStream(filePath: string) {
+export function getWriteStream(filePath: string) {
     const nodeWritable = fs.createWriteStream(
         filePath,
         { encoding: "utf-8", flags: 'a' }
@@ -96,7 +102,7 @@ function getWriteStream(filePath: string) {
     return nodeWritable;
 }
 
-async function finish(stream: fs.WriteStream ): Promise < void>  {
+async function finish(stream: fs.WriteStream): Promise<void> {
     stream.close();
     return new Promise((resolve, reject) => {
         stream.once('close', () => {
@@ -107,20 +113,42 @@ async function finish(stream: fs.WriteStream ): Promise < void>  {
 
 class Stream {
     private line: string | null = null;
-    constructor(private readonly stream: fs.ReadStream) { }
-    
-    isOpen() {
-        if (this.line !== null) {
-            return false;
-        }
-        return !this.stream.closed;
+    private iter: AsyncGenerator<string, void, unknown>;
+    private rl: readline.Interface;
+    private done: boolean = false;
+
+    constructor(private readonly stream: fs.ReadStream) {
+        const rl = readline.createInterface({
+            input: stream,
+            crlfDelay: Infinity
+        });
+        this.rl = rl;
+        this.iter = (async function* () {
+            for await (const line of rl) {
+                yield line
+            }
+        })()
     }
 
-    read() {
+    get isClosed() {
+        return this.line === null && this.done;
+    }
+
+    async read() {
         if (this.line !== null) {
             return this.line;
         }
-        
+        if (this.isClosed) {
+            return null;
+        }
+        const res = await this.iter.next();
+        if (res.done) {
+            this.done = true;
+            this.rl.close();
+            return null;
+        }
+        this.line = res.value;
+        return this.line;
     }
 
     take() {
@@ -131,43 +159,55 @@ class Stream {
 }
 
 type SortEntity = {
-    index: number;
+    stream: Stream;
     line: string;
 }
 
-function merge(files: Set<string>, outputFilePath: string): void {
-    console.log("startig sort")
-    const writeStream = fs.createWriteStream(
-        outputFilePath,
-        { encoding: "utf-8", flags: "a" }
-    );
+async function merge(files: Set<string>, outputFilePath: string): Promise<void> {
+    // console.log("startig sort")
+    const writeStream = getWriteStream(outputFilePath);
 
     const streams = Array.from(files).map((fileName) => {
         const filePath = path.resolve('tmp', fileName);
         return new Stream(fs.createReadStream(filePath));
     })
 
-    const hasLines = () => streams.length > 0;
+    const hasLines = () => streams.some((s) => !s.isClosed);
 
     // неэффективно. надо бы min-дерево
-    function getMinLine() {
-        const min = streams.map((stream, index) => ({ line: stream.read(), index }) as SortEntity)
-            .reduce((min: SortEntity, entry: SortEntity) =>
-                entry.line <= min.line ? entry : min, { line: '', index: 0 }
-        );
-        const stream = streams[min.index];
-        stream.take();
-        if (!stream.isOpen) {
-            streams.splice(min.index, 1);
+    async function getMinLine() {
+        const lines = (await Promise.all(
+            streams.filter((stream) => !stream.isClosed)
+                .map(async (stream, index) => ({ line: await stream.read(), stream }))
+        )).filter((se) => !!se)
+            .filter((se) => se.line !== null) as SortEntity[];
+
+        if (lines.length === 0) {
+            return null;
         }
+        const min = lines
+            .reduce((min: SortEntity, entry: SortEntity) =>
+                entry.line <= min.line ? entry : min, lines[0]
+            );
+
+        min.stream.take();
         return min.line;
 
     }
 
+    let i = 0;
+
     while (hasLines()) {
-        const line = getMinLine();
+        const line = await getMinLine();
+        if (line === null) {
+            continue;
+        }
+        // console.log('minLIne', i++, line)
         writeStream.write(line);
+        writeStream.write('\n');
     }
+
+    finish(writeStream);
 }
 
 async function clear(fileNames: Set<string>) {
